@@ -24,6 +24,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const ALLOWED_ENVIRONMENT: &[&str] = &[
     "PATH",
     "HOME",
+    // Account names, not secrets: Claude Code locates its keychain login by
+    // them and otherwise reports "Not logged in".
+    "USER",
+    "LOGNAME",
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
     "XDG_CONFIG_HOME",
@@ -446,6 +450,18 @@ async fn read_claude_stream<R: tokio::io::AsyncRead + Unpin>(
                     ));
                 }
                 if value["is_error"] == true || value["subtype"] != "success" {
+                    // Match only the CLI's own login status; never echo the
+                    // result text, which may contain model or prompt content.
+                    if value["result"]
+                        .as_str()
+                        .is_some_and(|result| result.to_ascii_lowercase().contains("not logged in"))
+                    {
+                        return Err(ProviderError {
+                            kind: ProviderErrorKind::Authentication,
+                            message: "Claude CLI is not logged in; run `claude` and use /login, then retry".into(),
+                            retryable: false,
+                        });
+                    }
                     return Err(invalid_cli_response(
                         "Claude failed its structured turn; check login, model availability and limits",
                     ));
@@ -875,6 +891,39 @@ mod tests {
                 .any(|key| key.contains("API_KEY"))
         );
         assert!(!ALLOWED_ENVIRONMENT.contains(&"ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn account_identity_reaches_cli_keychain_lookups() {
+        // Claude Code finds its macOS keychain login by account name; without
+        // USER it reports "Not logged in" even when the user is logged in.
+        assert!(ALLOWED_ENVIRONMENT.contains(&"USER"));
+        assert!(ALLOWED_ENVIRONMENT.contains(&"LOGNAME"));
+    }
+
+    async fn claude_stream(line: &str) -> Result<Vec<u8>, ProviderError> {
+        let (sink, _receiver) = mpsc::channel(8);
+        read_claude_stream(line.as_bytes(), &sink, &CancellationToken::new()).await
+    }
+
+    #[tokio::test]
+    async fn claude_logged_out_turns_are_authentication_failures() {
+        let error = claude_stream(
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}"#,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Authentication);
+        assert!(!error.retryable);
+        assert!(error.message.contains("not logged in"));
+
+        let other = claude_stream(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"secret prompt echo"}"#,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(other.kind, ProviderErrorKind::InvalidResponse);
+        assert!(!other.message.contains("secret prompt echo"));
     }
 
     #[cfg(unix)]

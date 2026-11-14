@@ -69,7 +69,7 @@ impl ModelCatalog {
             "ollama" => &self.ollama,
             "openai" => &self.openai,
             "anthropic" => &self.anthropic,
-            "codex_cli" | "claude_cli" => &self.cli,
+            "codex_cli" | "claude_cli" | "copilot_cli" => &self.cli,
             _ => &[],
         }
     }

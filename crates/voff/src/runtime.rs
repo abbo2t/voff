@@ -35,6 +35,7 @@ pub enum ProviderConfig {
     Anthropic { model: String, api_key_env: String },
     CodexCli { model: String },
     ClaudeCli { model: String },
+    CopilotCli { model: String },
 }
 
 #[derive(Clone, Debug)]
@@ -231,7 +232,9 @@ fn validate_provider(provider: &ProviderConfig) -> Result<(), RuntimeError> {
                 Ok(())
             }
         }
-        ProviderConfig::CodexCli { model } | ProviderConfig::ClaudeCli { model } => {
+        ProviderConfig::CodexCli { model }
+        | ProviderConfig::ClaudeCli { model }
+        | ProviderConfig::CopilotCli { model } => {
             if model.trim().is_empty() {
                 Err(RuntimeError::Invalid("model is empty"))
             } else {

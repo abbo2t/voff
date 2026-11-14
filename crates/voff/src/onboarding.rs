@@ -83,15 +83,17 @@ pub enum ProviderChoice {
     ClaudeCloud,
     CodexCli,
     ClaudeCli,
+    CopilotCli,
 }
 
 impl ProviderChoice {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Ollama,
         Self::OpenAi,
         Self::ClaudeCloud,
         Self::CodexCli,
         Self::ClaudeCli,
+        Self::CopilotCli,
     ];
 
     fn is_available(self) -> bool {
@@ -105,6 +107,7 @@ impl ProviderChoice {
             }
             Self::CodexCli => executable_available("codex"),
             Self::ClaudeCli => executable_available("claude"),
+            Self::CopilotCli => executable_available("copilot"),
         }
     }
 
@@ -112,6 +115,7 @@ impl ProviderChoice {
         [
             Self::CodexCli,
             Self::ClaudeCli,
+            Self::CopilotCli,
             Self::Ollama,
             Self::OpenAi,
             Self::ClaudeCloud,
@@ -132,6 +136,7 @@ impl ProviderChoice {
             "anthropic" | "claude_api" | "claude_cloud" => Ok(Self::ClaudeCloud),
             "codex" | "codex_cli" => Ok(Self::CodexCli),
             "claude" | "claude_cli" => Ok(Self::ClaudeCli),
+            "copilot" | "copilot_cli" => Ok(Self::CopilotCli),
             _ => Err(format!("unsupported provider `{value}`")),
         }
     }
@@ -144,6 +149,7 @@ impl ProviderChoice {
             Self::ClaudeCloud => "anthropic",
             Self::CodexCli => "codex_cli",
             Self::ClaudeCli => "claude_cli",
+            Self::CopilotCli => "copilot_cli",
         }
     }
 
@@ -155,6 +161,7 @@ impl ProviderChoice {
             Self::ClaudeCloud => "Claude · cloud",
             Self::CodexCli => "Codex · CLI",
             Self::ClaudeCli => "Claude · CLI",
+            Self::CopilotCli => "Copilot · CLI",
         }
     }
 
@@ -162,7 +169,7 @@ impl ProviderChoice {
         match self {
             Self::OpenAi => Some("OPENAI_API_KEY"),
             Self::ClaudeCloud => Some("ANTHROPIC_API_KEY"),
-            Self::Ollama | Self::CodexCli | Self::ClaudeCli => None,
+            Self::Ollama | Self::CodexCli | Self::ClaudeCli | Self::CopilotCli => None,
         }
     }
 
@@ -2840,6 +2847,7 @@ fn startup_provider_choices() -> Vec<ProviderChoice> {
     [
         ProviderChoice::CodexCli,
         ProviderChoice::ClaudeCli,
+        ProviderChoice::CopilotCli,
         ProviderChoice::Ollama,
         ProviderChoice::OpenAi,
     ]
@@ -4444,6 +4452,7 @@ mod tests {
     fn local_cli_providers_use_compact_labels() {
         assert_eq!(ProviderChoice::CodexCli.label(), "Codex · CLI");
         assert_eq!(ProviderChoice::ClaudeCli.label(), "Claude · CLI");
+        assert_eq!(ProviderChoice::CopilotCli.label(), "Copilot · CLI");
     }
 
     #[test]
@@ -5000,6 +5009,11 @@ mod tests {
             ProviderChoice::from_config_name("claude").unwrap(),
             ProviderChoice::ClaudeCli
         );
+        assert_eq!(
+            ProviderChoice::from_config_name("copilot_cli").unwrap(),
+            ProviderChoice::CopilotCli
+        );
+        assert_eq!(ProviderChoice::CopilotCli.id(), "copilot_cli");
     }
 
     #[test]

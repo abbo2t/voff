@@ -1,15 +1,36 @@
-//! Opt-in live test: uses existing Codex login and a disposable workspace.
+//! Opt-in live tests: use an existing local CLI login and a disposable workspace.
 use std::{sync::Arc, time::Duration};
 use voff_core::*;
 use voff_engine::Engine;
 use voff_provider::{LocalCliKind, LocalCliProvider, ResiliencePolicy, ResilientProvider};
 use voff_storage::{Repository, SqliteRepository};
 
-fn agent(name: &str, role: &str, tools: &[&str]) -> AgentProfile {
+#[derive(Clone, Copy)]
+struct Cli {
+    kind: LocalCliKind,
+    provider: &'static str,
+    model_env: &'static str,
+    label: &'static str,
+}
+
+const CODEX: Cli = Cli {
+    kind: LocalCliKind::Codex,
+    provider: "codex_cli",
+    model_env: "VOFF_TEST_CODEX_MODEL",
+    label: "Codex",
+};
+const COPILOT: Cli = Cli {
+    kind: LocalCliKind::Copilot,
+    provider: "copilot_cli",
+    model_env: "VOFF_TEST_COPILOT_MODEL",
+    label: "Copilot",
+};
+
+fn agent(cli: Cli, name: &str, role: &str, tools: &[&str]) -> AgentProfile {
     AgentProfile {
         id: AgentId::new(), name: name.into(), role: role.into(),
-        provider: "codex_cli".into(),
-        model: std::env::var("VOFF_TEST_CODEX_MODEL").unwrap_or_else(|_| "default".into()),
+        provider: cli.provider.into(),
+        model: std::env::var(cli.model_env).unwrap_or_else(|_| "default".into()),
         system_prompt: "Follow the exact tiny fixture objective. Propose Voff tools only. Do not execute commands or inspect files yourself.".into(),
         tools: tools.iter().map(|s| (*s).into()).collect(),
         max_output_tokens: 2048, enabled: true, allowed_targets: vec![],
@@ -20,19 +41,29 @@ fn agent(name: &str, role: &str, tools: &[&str]) -> AgentProfile {
 #[tokio::test]
 #[ignore = "requires installed, logged-in Codex; performs three real model requests"]
 async fn local_codex_delegates_and_applies_two_files() {
+    delegates_and_applies_two_files(CODEX).await;
+}
+
+#[tokio::test]
+#[ignore = "requires installed, logged-in Copilot CLI; performs three real model requests"]
+async fn local_copilot_delegates_and_applies_two_files() {
+    delegates_and_applies_two_files(COPILOT).await;
+}
+
+async fn delegates_and_applies_two_files(cli: Cli) {
     tokio::time::timeout(Duration::from_secs(540), async {
         let workspace = tempfile::tempdir().unwrap();
         let database = workspace.path().join("test.db");
         let repo = Arc::new(SqliteRepository::open(&database).await.unwrap());
-        let mut lead = agent("Lead", "coordinator", &["task.delegate"]);
-        let backend = agent("Backend", "backend_developer", &["file.patch"]);
-        let frontend = agent("Frontend", "frontend_developer", &["file.patch"]);
+        let mut lead = agent(cli, "Lead", "coordinator", &["task.delegate"]);
+        let backend = agent(cli, "Backend", "backend_developer", &["file.patch"]);
+        let frontend = agent(cli, "Frontend", "frontend_developer", &["file.patch"]);
         lead.allowed_targets = vec![backend.name.clone(), frontend.name.clone()];
         for profile in [&lead, &backend, &frontend] {
             repo.save_agent(profile.clone()).await.unwrap();
         }
         let provider = Arc::new(ResilientProvider::new(
-            Arc::new(LocalCliProvider::new(LocalCliKind::Codex, workspace.path()).unwrap()),
+            Arc::new(LocalCliProvider::new(cli.kind, workspace.path()).unwrap()),
             ResiliencePolicy::default(),
         ));
         let session = SessionId::new();
@@ -47,11 +78,11 @@ async fn local_codex_delegates_and_applies_two_files() {
             "Create exactly two independent child tasks using one task.delegate proposals array. Backend must propose file.patch creating backend.txt with exactly BACKEND_OK followed by a newline. Frontend must propose file.patch creating frontend.txt with exactly FRONTEND_OK followed by a newline. No other files or work. Include the precise filename and content in each child's objective and acceptance criteria.",
             vec!["Both exact files exist".into()],
         ).await.unwrap();
-        eprintln!("live Codex root: {}", root.id);
+        eprintln!("live {} root: {}", cli.label, root.id);
         engine.mark_ready(root.id).await.unwrap();
         engine.run_task(root.id).await.unwrap();
         let streamed = repo.events(session).await.unwrap();
-        let preview = streamed.iter().position(|event| matches!(event.kind, CanonicalEventKind::GenerationDelta(_))).expect("Codex must provide live generation deltas");
+        let preview = streamed.iter().position(|event| matches!(event.kind, CanonicalEventKind::GenerationDelta(_))).expect("the CLI must provide live generation deltas");
         let approval = streamed.iter().position(|event| matches!(event.kind, CanonicalEventKind::ApprovalRequested { .. })).expect("expected delegation approval");
         assert!(preview < approval, "generation must be visible before actions become approvable");
         let approvals = repo.approvals(session).await.unwrap();
@@ -86,5 +117,5 @@ async fn local_codex_delegates_and_applies_two_files() {
         eprintln!("verified two delegated files, approval evidence, parent completion, and SQLite reopen");
         drop(engine);
         events.await.unwrap();
-    }).await.expect("live Codex test exceeded nine minutes");
+    }).await.expect("live CLI test exceeded nine minutes");
 }

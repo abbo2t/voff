@@ -5347,6 +5347,7 @@ fn agent_usage_rows(app: &AppModel) -> Vec<AgentUsageRow> {
                 provider: match provider {
                     "codex_cli" => "Codex CLI",
                     "claude_cli" => "Claude CLI",
+                    "copilot_cli" => "Copilot CLI",
                     "ollama" => "Ollama",
                     "openai" => "OpenAI API",
                     "anthropic" => "Claude API",

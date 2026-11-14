@@ -667,6 +667,7 @@ fn agent_card(agent: &AgentProfile, snapshot: &TeamSnapshot<'_>, agent_color: Co
         provider: match provider_kind {
             "codex_cli" => "Codex CLI",
             "claude_cli" => "Claude CLI",
+            "copilot_cli" => "Copilot CLI",
             "ollama" => "Ollama · local",
             "openai" => "OpenAI API",
             "anthropic" => "Claude API",

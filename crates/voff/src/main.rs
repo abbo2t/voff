@@ -708,6 +708,7 @@ fn setup_draft_for_team(config: &RuntimeTeam, agents: &[AgentProfile]) -> Option
                 ProviderConfig::Anthropic { .. } => ProviderChoice::ClaudeCloud,
                 ProviderConfig::CodexCli { .. } => ProviderChoice::CodexCli,
                 ProviderConfig::ClaudeCli { .. } => ProviderChoice::ClaudeCli,
+                ProviderConfig::CopilotCli { .. } => ProviderChoice::CopilotCli,
                 ProviderConfig::Mock => return None,
             };
             let role = [
@@ -763,6 +764,9 @@ fn provider_from_choice(provider: ProviderChoice, model: &str) -> ProviderConfig
             model: model.into(),
         },
         ProviderChoice::ClaudeCli => ProviderConfig::ClaudeCli {
+            model: model.into(),
+        },
+        ProviderChoice::CopilotCli => ProviderConfig::CopilotCli {
             model: model.into(),
         },
     }
@@ -1326,7 +1330,8 @@ fn provider_api_key_env(value: &ProviderConfig) -> Option<&str> {
         ProviderConfig::Mock
         | ProviderConfig::Ollama { .. }
         | ProviderConfig::CodexCli { .. }
-        | ProviderConfig::ClaudeCli { .. } => None,
+        | ProviderConfig::ClaudeCli { .. }
+        | ProviderConfig::CopilotCli { .. } => None,
     }
 }
 
@@ -1338,6 +1343,7 @@ fn provider_name(value: &ProviderConfig) -> &'static str {
         ProviderConfig::Anthropic { .. } => "anthropic",
         ProviderConfig::CodexCli { .. } => "codex_cli",
         ProviderConfig::ClaudeCli { .. } => "claude_cli",
+        ProviderConfig::CopilotCli { .. } => "copilot_cli",
     }
 }
 fn model_name(value: &ProviderConfig) -> String {
@@ -1346,7 +1352,9 @@ fn model_name(value: &ProviderConfig) -> String {
         ProviderConfig::Ollama { model, .. } => model.clone(),
         ProviderConfig::Openai { model, .. } => model.clone(),
         ProviderConfig::Anthropic { model, .. } => model.clone(),
-        ProviderConfig::CodexCli { model } | ProviderConfig::ClaudeCli { model } => model.clone(),
+        ProviderConfig::CodexCli { model }
+        | ProviderConfig::ClaudeCli { model }
+        | ProviderConfig::CopilotCli { model } => model.clone(),
     }
 }
 fn provider(
@@ -1392,6 +1400,9 @@ fn provider(
         }
         ProviderConfig::ClaudeCli { .. } => {
             Arc::new(LocalCliProvider::new(LocalCliKind::Claude, workspace)?)
+        }
+        ProviderConfig::CopilotCli { .. } => {
+            Arc::new(LocalCliProvider::new(LocalCliKind::Copilot, workspace)?)
         }
     };
     Ok(Arc::new(ResilientProvider::new(

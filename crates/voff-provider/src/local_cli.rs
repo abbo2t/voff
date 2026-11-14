@@ -17,7 +17,10 @@ use tokio::{
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
-use voff_prompts::{provider::LOCAL_CLI_PREFIX, tool_descriptions};
+use voff_prompts::{
+    provider::{LOCAL_CLI_PREFIX, LOCAL_CLI_SCHEMA_SUFFIX},
+    tool_descriptions,
+};
 
 const MAX_CLI_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,6 +45,7 @@ const ALLOWED_ENVIRONMENT: &[&str] = &[
 pub enum LocalCliKind {
     Codex,
     Claude,
+    Copilot,
 }
 
 impl LocalCliKind {
@@ -49,6 +53,7 @@ impl LocalCliKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Copilot => "copilot",
         }
     }
 
@@ -56,6 +61,7 @@ impl LocalCliKind {
         match self {
             Self::Codex => "Local Codex CLI",
             Self::Claude => "Local Claude Code CLI",
+            Self::Copilot => "Local GitHub Copilot CLI",
         }
     }
 
@@ -63,9 +69,37 @@ impl LocalCliKind {
         match self {
             Self::Codex => "codex_cli",
             Self::Claude => "claude_cli",
+            Self::Copilot => "copilot_cli",
         }
     }
 }
+
+/// Copilot has no schema flag, so the schema travels in the prompt and the
+/// reply is validated by `parse_local_output` like every other local CLI.
+const COPILOT_REQUIRED_FLAGS: &[&str] = &[
+    "--output-format",
+    "--stream",
+    "--available-tools",
+    "--deny-tool",
+    "--disable-builtin-mcps",
+    "--no-ask-user",
+    "--no-custom-instructions",
+    "--disallow-temp-dir",
+    "--no-auto-update",
+];
+
+/// A tool name that does not exist. An empty `--available-tools` value is
+/// ignored by Copilot and leaves every native tool visible.
+const COPILOT_NO_TOOLS: &str = "--available-tools=voff_no_native_tools";
+
+/// Deny rules win over every allow rule in Copilot, including allow-all.
+const COPILOT_DENY_RULES: &[&str] = &[
+    "--deny-tool=shell",
+    "--deny-tool=write",
+    "--deny-tool=read",
+    "--deny-tool=url",
+    "--deny-tool=memory",
+];
 
 #[derive(Clone, Debug)]
 pub struct LocalCliProvider {
@@ -143,6 +177,10 @@ impl ModelProvider for LocalCliProvider {
                 self.run_claude(&request.model, &prompt, &schema, &sink, &cancellation)
                     .await
             }
+            LocalCliKind::Copilot => {
+                self.run_copilot(&request.model, &prompt, &schema, &sink, &cancellation)
+                    .await
+            }
         }
         .inspect_err(|error| {
             tracing::warn!(
@@ -205,11 +243,14 @@ impl LocalCliProvider {
             LocalCliKind::Codex => {
                 command.args(["app-server", "--help"]);
             }
-            LocalCliKind::Claude => {
+            LocalCliKind::Claude | LocalCliKind::Copilot => {
                 command.arg("--help");
             }
         }
         configure_environment(&mut command);
+        if self.kind == LocalCliKind::Copilot {
+            configure_copilot_environment(&mut command, execution_directory.path());
+        }
         let output =
             tokio::time::timeout(PROBE_TIMEOUT, run_process(command, b"", cancellation, None))
                 .await
@@ -229,6 +270,7 @@ impl LocalCliProvider {
                 "--no-session-persistence",
                 "--include-partial-messages",
             ],
+            LocalCliKind::Copilot => COPILOT_REQUIRED_FLAGS,
         };
         let missing = required
             .iter()
@@ -297,7 +339,13 @@ impl LocalCliProvider {
             command.arg("--model").arg(model);
         }
         configure_environment(&mut command);
-        let envelope = run_process(command, prompt, cancellation, Some(sink)).await?;
+        let envelope = run_process(
+            command,
+            prompt,
+            cancellation,
+            Some((StreamFormat::Claude, sink)),
+        )
+        .await?;
         let envelope: Value = serde_json::from_slice(&envelope).map_err(|error| {
             invalid_cli_response(&format!("Claude CLI returned invalid JSON: {error}"))
         })?;
@@ -310,6 +358,97 @@ impl LocalCliProvider {
         .map_err(|error| invalid_cli_response(&format!("Claude structured output: {error}")))?;
         Ok((output, usage))
     }
+
+    async fn run_copilot(
+        &self,
+        model: &str,
+        prompt: &[u8],
+        schema: &Value,
+        sink: &ProviderEventSink,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<u8>, Option<Usage>), ProviderError> {
+        let mut prompt = prompt.to_vec();
+        prompt.extend_from_slice(LOCAL_CLI_SCHEMA_SUFFIX.as_bytes());
+        serde_json::to_writer(&mut prompt, schema).map_err(|error| {
+            invalid_cli_response(&format!("could not encode local output schema: {error}"))
+        })?;
+        // The temporary directory is both the working directory and
+        // COPILOT_HOME, so user MCP servers, settings, permission grants and
+        // saved sessions are neither loaded nor left behind.
+        let execution_directory = tempfile::tempdir().map_err(local_io_error)?;
+        let mut command = Command::new(&self.executable);
+        command
+            .current_dir(execution_directory.path())
+            .args(copilot_arguments(model));
+        configure_environment(&mut command);
+        configure_copilot_environment(&mut command, execution_directory.path());
+        let message = run_process(
+            command,
+            &prompt,
+            cancellation,
+            Some((StreamFormat::Copilot, sink)),
+        )
+        .await?;
+        let message: Value = serde_json::from_slice(&message).map_err(|error| {
+            invalid_cli_response(&format!("Copilot CLI returned invalid JSON: {error}"))
+        })?;
+        let content = message["data"]["content"]
+            .as_str()
+            .ok_or_else(|| invalid_cli_response("Copilot CLI omitted message content"))?;
+        // Copilot bills premium requests rather than tokens; report only the
+        // effective model so "auto" selections remain visible.
+        let usage = message["data"]["model"].as_str().map(|model| Usage {
+            model: Some(model.into()),
+            ..Usage::default()
+        });
+        Ok((extract_json_object(content).as_bytes().to_vec(), usage))
+    }
+}
+
+fn copilot_arguments(model: &str) -> Vec<String> {
+    let mut arguments = [
+        "--output-format",
+        "json",
+        "--stream",
+        "on",
+        COPILOT_NO_TOOLS,
+        "--disable-builtin-mcps",
+        "--no-ask-user",
+        "--no-custom-instructions",
+        "--disallow-temp-dir",
+        "--no-auto-update",
+        "--disable-client-telemetry",
+    ]
+    .iter()
+    .chain(COPILOT_DENY_RULES)
+    .map(|argument| (*argument).to_owned())
+    .collect::<Vec<_>>();
+    if model != "default" {
+        arguments.extend(["--model".into(), model.into()]);
+    }
+    arguments
+}
+
+fn configure_copilot_environment(command: &mut Command, home: &Path) {
+    command
+        .env("COPILOT_HOME", home)
+        .env("COPILOT_AUTO_UPDATE", "false");
+}
+
+/// Accepts a bare object or one wrapped in Markdown fences or brief prose.
+/// The extracted text is still validated strictly by `parse_local_output`.
+fn extract_json_object(content: &str) -> &str {
+    let trimmed = content.trim();
+    match (trimmed.find('{'), trimmed.rfind('}')) {
+        (Some(start), Some(end)) if start < end => &trimmed[start..=end],
+        _ => trimmed,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StreamFormat {
+    Claude,
+    Copilot,
 }
 
 fn claude_usage(usage: &Value) -> Option<Usage> {
@@ -352,7 +491,7 @@ async fn run_process(
     mut command: Command,
     prompt: &[u8],
     cancellation: &CancellationToken,
-    preview: Option<&ProviderEventSink>,
+    preview: Option<(StreamFormat, &ProviderEventSink)>,
 ) -> Result<Vec<u8>, ProviderError> {
     let program = command
         .as_std()
@@ -380,7 +519,12 @@ async fn run_process(
         };
         let read_stdout = async {
             match (stdout, preview) {
-                (Some(stdout), Some(sink)) => read_claude_stream(stdout, sink, cancellation).await,
+                (Some(stdout), Some((StreamFormat::Claude, sink))) => {
+                    read_claude_stream(stdout, sink, cancellation).await
+                }
+                (Some(stdout), Some((StreamFormat::Copilot, sink))) => {
+                    read_copilot_stream(stdout, sink, cancellation).await
+                }
                 (stdout, _) => read_pipe(stdout).await,
             }
         };
@@ -481,6 +625,89 @@ async fn read_claude_stream<R: tokio::io::AsyncRead + Unpin>(
     })
 }
 
+/// Returns the final `assistant.message` line once a successful `result`
+/// arrives. Any native tool activity fails the turn: Voff never lets a local
+/// CLI act on the workspace directly.
+async fn read_copilot_stream<R: tokio::io::AsyncRead + Unpin>(
+    stdout: R,
+    sink: &ProviderEventSink,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut reader = BufReader::new(stdout);
+    let mut total = 0usize;
+    let mut message = None;
+    let mut finished = false;
+    loop {
+        let mut line = Vec::new();
+        let size = (&mut reader)
+            .take((MAX_CLI_OUTPUT_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(local_io_error)?;
+        if size == 0 {
+            break;
+        }
+        total = total.saturating_add(size);
+        if size > MAX_CLI_OUTPUT_BYTES || total > 16 * MAX_CLI_OUTPUT_BYTES {
+            return Err(invalid_cli_response(
+                "Copilot stream exceeded bounded output limits",
+            ));
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&line)
+            .map_err(|_| invalid_cli_response("Copilot returned malformed stream JSON"))?;
+        let kind = value["type"].as_str().unwrap_or_default();
+        if kind.starts_with("tool.") || kind == "assistant.tool_call_delta" {
+            return Err(native_tool_attempt());
+        }
+        match kind {
+            _ if finished && kind == "result" => {
+                return Err(invalid_cli_response(
+                    "Copilot returned multiple terminal results",
+                ));
+            }
+            _ if finished => {} // Trailing metadata cannot change the turn.
+            "assistant.message_delta" => {
+                if let Some(text) = value["data"]["deltaContent"].as_str() {
+                    send(sink, ProviderEvent::OutputDelta(text.into()), cancellation).await?;
+                }
+            }
+            "assistant.message" => {
+                if value["data"]["toolRequests"]
+                    .as_array()
+                    .is_some_and(|requests| !requests.is_empty())
+                {
+                    return Err(native_tool_attempt());
+                }
+                message = Some(line);
+            }
+            "result" => {
+                if value["exitCode"].as_i64() != Some(0) {
+                    return Err(invalid_cli_response(
+                        "Copilot failed its turn; check login, model availability and limits",
+                    ));
+                }
+                finished = true;
+            }
+            _ => {} // Metadata and reasoning are never interpreted as Voff actions.
+        }
+    }
+    if !finished {
+        return Err(ProviderError {
+            kind: ProviderErrorKind::Internal,
+            message: "Copilot stream ended before a terminal result".into(),
+            retryable: true,
+        });
+    }
+    message.ok_or_else(|| invalid_cli_response("Copilot finished without an assistant message"))
+}
+
+fn native_tool_attempt() -> ProviderError {
+    invalid_cli_response("Copilot attempted a native tool; Voff only accepts proposed Voff tools")
+}
+
 pub(super) async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(
     pipe: Option<R>,
 ) -> Result<Vec<u8>, ProviderError> {
@@ -562,6 +789,7 @@ fn classify_process_failure(
         } else if diagnostic.contains("model_not_found")
             || diagnostic.contains("model not found")
             || diagnostic.contains("does not exist")
+            || (diagnostic.contains("model") && diagnostic.contains("is not available"))
         {
             (
                 ProviderErrorKind::InvalidResponse,
@@ -883,6 +1111,141 @@ mod tests {
         assert!(rate.retryable);
     }
 
+    async fn copilot_stream(
+        lines: &[&str],
+    ) -> (Vec<ProviderEvent>, Result<Vec<u8>, ProviderError>) {
+        let input = lines.join("\n");
+        let (sink, mut receiver) = mpsc::channel(32);
+        let result = read_copilot_stream(input.as_bytes(), &sink, &CancellationToken::new()).await;
+        drop(sink);
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+        (events, result)
+    }
+
+    #[tokio::test]
+    async fn copilot_stream_previews_deltas_and_keeps_the_final_message() {
+        let (events, result) = copilot_stream(&[
+            r#"{"type":"assistant.message_delta","data":{"deltaContent":"draft"}}"#,
+            r#"{"type":"assistant.message","data":{"content":"first","toolRequests":[]}}"#,
+            r#"{"type":"assistant.message","data":{"content":"final","toolRequests":[]}}"#,
+            r#"{"type":"result","exitCode":0}"#,
+            r#"{"type":"session.shutdown","data":{}}"#,
+        ])
+        .await;
+        let line: Value = serde_json::from_slice(&result.unwrap()).unwrap();
+        assert_eq!(line["data"]["content"], "final");
+        assert_eq!(events, [ProviderEvent::OutputDelta("draft".into())]);
+    }
+
+    #[tokio::test]
+    async fn copilot_native_tool_activity_fails_closed() {
+        for lines in [
+            &[r#"{"type":"tool.execution_start","data":{"toolName":"bash"}}"#][..],
+            &[r#"{"type":"assistant.tool_call_delta","data":{}}"#][..],
+            &[
+                r#"{"type":"assistant.message","data":{"content":"","toolRequests":[{"name":"bash"}]}}"#,
+                r#"{"type":"result","exitCode":0}"#,
+            ][..],
+        ] {
+            let error = copilot_stream(lines).await.1.unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+            assert!(error.message.contains("native tool"));
+        }
+    }
+
+    #[tokio::test]
+    async fn copilot_incomplete_or_failed_turns_are_rejected() {
+        let message = r#"{"type":"assistant.message","data":{"content":"{}","toolRequests":[]}}"#;
+        let failed = copilot_stream(&[message, r#"{"type":"result","exitCode":1}"#])
+            .await
+            .1
+            .unwrap_err();
+        assert_eq!(failed.kind, ProviderErrorKind::InvalidResponse);
+
+        let truncated = copilot_stream(&[message]).await.1.unwrap_err();
+        assert_eq!(truncated.kind, ProviderErrorKind::Internal);
+        assert!(truncated.retryable);
+
+        let silent = copilot_stream(&[r#"{"type":"result","exitCode":0}"#])
+            .await
+            .1
+            .unwrap_err();
+        assert!(silent.message.contains("without an assistant message"));
+
+        let twice = copilot_stream(&[
+            message,
+            r#"{"type":"result","exitCode":0}"#,
+            r#"{"type":"result","exitCode":0}"#,
+        ])
+        .await
+        .1
+        .unwrap_err();
+        assert!(twice.message.contains("multiple terminal results"));
+
+        let malformed = copilot_stream(&["not json"]).await.1.unwrap_err();
+        assert!(malformed.message.contains("malformed"));
+    }
+
+    #[test]
+    fn copilot_json_is_extracted_from_fences_but_still_strictly_parsed() {
+        assert_eq!(
+            extract_json_object("```json\n{\"text\":\"a\",\"tool_calls\":[]}\n```"),
+            r#"{"text":"a","tool_calls":[]}"#
+        );
+        assert_eq!(extract_json_object("Here: {\"a\":1} done"), r#"{"a":1}"#);
+        assert_eq!(extract_json_object("no object"), "no object");
+        assert!(
+            parse_local_output(
+                extract_json_object("Here: {\"a\":1}").as_bytes(),
+                &[],
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn copilot_arguments_hide_and_deny_every_native_tool() {
+        let arguments = copilot_arguments("default");
+        assert!(arguments.contains(&COPILOT_NO_TOOLS.to_owned()));
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "--available-tools=")
+        );
+        for rule in COPILOT_DENY_RULES {
+            assert!(arguments.contains(&(*rule).to_owned()));
+        }
+        for unsafe_flag in [
+            "--allow-all",
+            "--yolo",
+            "--allow-all-tools",
+            "--allow-all-paths",
+            "--allow-all-urls",
+            "-p",
+        ] {
+            assert!(!arguments.iter().any(|argument| argument == unsafe_flag));
+        }
+        assert!(!arguments.contains(&"--model".to_owned()));
+        let pinned = copilot_arguments("gpt-test");
+        assert_eq!(pinned[pinned.len() - 2..], ["--model", "gpt-test"]);
+    }
+
+    #[test]
+    fn copilot_unavailable_model_is_classified() {
+        use std::os::unix::process::ExitStatusExt;
+        let error = classify_process_failure(
+            "copilot",
+            std::process::ExitStatus::from_raw(256),
+            br#"Error: Model "no-such-model" from --model flag is not available."#,
+        );
+        assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+        assert!(error.message.contains("configured model"));
+    }
+
     #[test]
     fn api_key_variables_are_never_inherited() {
         assert!(
@@ -962,6 +1325,22 @@ cat >/dev/null
 printf '%s\n' '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"claude"}}}' '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":6,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4},"structured_output":{"text":"claude ok","tool_calls":[]}}'
 "#,
                 (11, 4),
+            ),
+            (
+                LocalCliKind::Copilot,
+                r#"#!/bin/sh
+if [ "$1" = '--help' ]; then
+  printf '%s\n' '--output-format --stream --available-tools --deny-tool --disable-builtin-mcps --no-ask-user --no-custom-instructions --disallow-temp-dir --no-auto-update'
+  exit 0
+fi
+case " $* " in *' --available-tools=voff_no_native_tools '*) ;; *) exit 3 ;; esac
+case " $* " in *' --deny-tool=shell '*) ;; *) exit 4 ;; esac
+[ "$(cd "$COPILOT_HOME" && pwd -P)" = "$(pwd -P)" ] || exit 5
+[ "$COPILOT_AUTO_UPDATE" = false ] || exit 6
+grep -q 'validate against this JSON Schema' || exit 7
+printf '%s\n' '{"type":"session.start","data":{}}' '{"type":"assistant.message_delta","data":{"deltaContent":"{\"text\""}}' '{"type":"assistant.message","data":{"model":"gpt-test","content":"Working on it.","toolRequests":[]}}' '{"type":"assistant.message","data":{"model":"gpt-test","content":"```json\n{\"text\":\"copilot ok\",\"tool_calls\":[]}\n```","toolRequests":[]}}' '{"type":"result","exitCode":0,"usage":{"premiumRequests":1}}'
+"#,
+                (0, 0),
             ),
         ] {
             let executable = directory.path().join(kind.id());
